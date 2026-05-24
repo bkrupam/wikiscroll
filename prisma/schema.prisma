@@ -1,0 +1,40 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Card {
+  id           String        @id @default(cuid())
+  hookText     String
+  wikiTitle    String
+  wikiUrl      String
+  categories   String        // JSON array: ["Psychology","History"]
+  gradientId   Int           // 1–6
+  hookScore    Float
+  tier         Int           // 1=seed, 2=broad, 3=personalized
+  served       Boolean       @default(false)
+  createdAt    DateTime      @default(now())
+
+  interactions Interaction[]
+}
+
+model Interaction {
+  id           String   @id @default(cuid())
+  cardId       String
+  card         Card     @relation(fields: [cardId], references: [id])
+  type         String   // "LIKE" | "DWELL" | "SKIP"
+  dwellSeconds Float?
+  createdAt    DateTime @default(now())
+}
+
+model CategoryArm {
+  category   String   @id
+  alpha      Float    @default(1.0)
+  beta       Float    @default(1.0)
+  totalPulls Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
