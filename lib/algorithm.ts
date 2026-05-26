@@ -140,6 +140,25 @@ export async function boostExplicit(nodeId: string): Promise<void> {
   }
 }
 
+/**
+ * Inverse of boostExplicit — explicit "remove this topic" from the modal.
+ * Heavy β bump on the chosen node only. We do NOT propagate to parents:
+ * removing "Neuroplasticity" doesn't mean the user hates "Psychology",
+ * just that one branch.
+ */
+export async function dampenExplicit(nodeId: string): Promise<void> {
+  const node = await db.topicNode.findUnique({ where: { id: nodeId } })
+  if (!node) return
+
+  await db.categoryArm.update({
+    where: { nodeId: node.id },
+    data:  {
+      beta:       { increment: 5.0 },
+      totalPulls: { increment: 1 },
+    },
+  }).catch(() => {})
+}
+
 /* ── feed generation ─────────────────────────────────────────────────────── */
 
 type DbCard = Card

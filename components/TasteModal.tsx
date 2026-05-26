@@ -51,6 +51,7 @@ export function TasteModal({ onClose }: TasteModalProps) {
   const [loadingNodes, setLoadingNodes]       = useState<Set<string>>(new Set())
   const [expanded, setExpanded]               = useState<Set<string>>(new Set())
   const [boosted, setBoosted]                 = useState<Set<string>>(new Set())
+  const [removed, setRemoved]                 = useState<Set<string>>(new Set())
   const [loading, setLoading]                 = useState(true)
 
   useEffect(() => {
@@ -63,8 +64,10 @@ export function TasteModal({ onClose }: TasteModalProps) {
       .catch(() => setLoading(false))
   }, [])
 
-  const isConfirmed = (n: NodeData) =>
-    boosted.has(n.id) || (n.mean > CONFIRMED_THRESHOLD && n.totalPulls >= 2)
+  const isConfirmed = (n: NodeData) => {
+    if (removed.has(n.id)) return false
+    return boosted.has(n.id) || (n.mean > CONFIRMED_THRESHOLD && n.totalPulls >= 2)
+  }
 
   const confirmed = useMemo(
     () => roots.filter(isConfirmed).sort((a, b) => b.mean - a.mean),
@@ -94,8 +97,12 @@ export function TasteModal({ onClose }: TasteModalProps) {
   }
 
   async function handlePillClick(node: NodeData) {
-    // Always boost (fire and forget). Backend already accumulates alpha,
-    // so repeat clicks just compound the signal — that's fine.
+    // Always boost (fire and forget). Clears any prior "removed" mark so the
+    // pill flips back to lime if it had been dismissed earlier this session.
+    setRemoved((r) => {
+      if (!r.has(node.id)) return r
+      const next = new Set(r); next.delete(node.id); return next
+    })
     if (!boosted.has(node.id)) {
       setBoosted((b) => new Set(b).add(node.id))
     }
@@ -116,6 +123,24 @@ export function TasteModal({ onClose }: TasteModalProps) {
       })
       if (!isOpen) loadChildren(node.id)
     }
+  }
+
+  function handlePillRemove(node: NodeData) {
+    setBoosted((b) => {
+      if (!b.has(node.id)) return b
+      const next = new Set(b); next.delete(node.id); return next
+    })
+    setRemoved((r) => new Set(r).add(node.id))
+    // Also collapse any children that were open under it
+    setExpanded((e) => {
+      if (!e.has(node.id)) return e
+      const next = new Set(e); next.delete(node.id); return next
+    })
+    fetch('/api/preferences', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ remove: [node.id] }),
+    }).catch(console.error)
   }
 
   return (
@@ -189,6 +214,7 @@ export function TasteModal({ onClose }: TasteModalProps) {
                     childrenMap={childrenMap}
                     loadingNodes={loadingNodes}
                     onClick={handlePillClick}
+                    onRemove={handlePillRemove}
                   />
                 )}
               </Section>
@@ -205,6 +231,7 @@ export function TasteModal({ onClose }: TasteModalProps) {
                       childrenMap={childrenMap}
                       loadingNodes={loadingNodes}
                       onClick={handlePillClick}
+                      onRemove={handlePillRemove}
                     />
                   </Section>
                 </>
@@ -261,13 +288,14 @@ interface StackProps {
   childrenMap:  Record<string, NodeData[]>
   loadingNodes: Set<string>
   onClick:      (n: NodeData) => void
+  onRemove:     (n: NodeData) => void
 }
 
 /** A flowing row of pills. When a pill is expanded its children render on the
  *  row directly under it, indented with a soft left divider — no chevrons,
  *  no inline icons inside the pills themselves. */
 function PillStack(props: StackProps) {
-  const { nodes, expanded, isConfirmed, childrenMap, loadingNodes, onClick } = props
+  const { nodes, expanded, isConfirmed, childrenMap, loadingNodes, onClick, onRemove } = props
 
   return (
     <div className="flex flex-col" style={{ gap: '12px' }}>
@@ -279,6 +307,7 @@ function PillStack(props: StackProps) {
             node={n}
             active={isConfirmed(n)}
             onClick={() => onClick(n)}
+            onRemove={() => onRemove(n)}
           />
         ))}
       </div>
@@ -300,27 +329,57 @@ function PillStack(props: StackProps) {
 }
 
 function Pill({
-  node, active, onClick,
+  node, active, onClick, onRemove,
 }: {
-  node:    NodeData
-  active:  boolean
-  onClick: () => void
+  node:     NodeData
+  active:   boolean
+  onClick:  () => void
+  onRemove: () => void
 }) {
+  // The pill body is an interactive div (so it can host a nested × button
+  // without invalid nested-button HTML). active=true shows the × on hover.
   return (
-    <button
+    <div
+      role="button"
+      tabIndex={0}
       onClick={onClick}
-      className="text-[13px] font-medium transition-colors cursor-pointer select-none"
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick() }
+      }}
+      className="group inline-flex items-center text-[13px] font-medium transition-colors cursor-pointer select-none"
       style={{
         background:   active ? C.limeFill : 'transparent',
         border:       `1px solid ${active ? C.lime : C.ash}`,
         color:        C.ink,
         borderRadius: '999px',
-        padding:      '8px 16px',
+        padding:      active ? '6px 6px 6px 16px' : '8px 16px',
         lineHeight:   1.2,
+        gap:          '8px',
       }}
     >
-      {node.name}
-    </button>
+      <span>{node.name}</span>
+      {active && (
+        <button
+          type="button"
+          aria-label={`Remove ${node.name}`}
+          onClick={(e) => { e.stopPropagation(); onRemove() }}
+          className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity flex items-center justify-center"
+          style={{
+            width:        '18px',
+            height:       '18px',
+            borderRadius: '999px',
+            background:   'transparent',
+            color:        C.ink,
+          }}
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18" />
+            <line x1="6" y1="6" x2="18" y2="18" />
+          </svg>
+        </button>
+      )}
+    </div>
   )
 }
 
