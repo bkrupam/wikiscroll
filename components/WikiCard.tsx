@@ -24,10 +24,13 @@ export const GRADIENTS: Record<number, string> = {
 
 interface CardPanelProps {
   card: CardData
+  saved?: boolean
+  onSave?: () => void
+  threadLabel?: string   // e.g. "Hellenistic Greece" — shown when rabbit hole active
 }
 
 /** Pure presentational white card — Base44-style panel sitting on the gradient */
-export function CardPanel({ card }: CardPanelProps) {
+export function CardPanel({ card, saved = false, onSave, threadLabel }: CardPanelProps) {
   return (
     <div className="relative w-full max-w-[920px]">
       <div
@@ -39,6 +42,25 @@ export function CardPanel({ card }: CardPanelProps) {
           boxShadow: 'rgba(34, 40, 42, 0.06) 0px 4px 24px 0px',
         }}
       >
+        {/* Thread label — appears when rabbit hole is active */}
+        {threadLabel && (
+          <div
+            className="flex items-center gap-1.5 mb-5"
+            style={{
+              opacity: 1,
+              animation: 'fadeIn 0.3s ease-out',
+            }}
+          >
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none"
+              stroke="#696f7b" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="9 18 15 12 9 6" />
+            </svg>
+            <span className="text-[11px] text-[#696f7b] font-medium tracking-[0.04em]">
+              following · {threadLabel}
+            </span>
+          </div>
+        )}
+
         {/* Category tags */}
         {card.categories.length > 0 && (
           <div className="flex gap-3 flex-wrap mb-8">
@@ -86,7 +108,37 @@ export function CardPanel({ card }: CardPanelProps) {
             </svg>
             <span>Read on Wikipedia</span>
           </a>
-          <LikeButton cardId={card.id} />
+
+          <div className="flex items-center gap-3">
+            <LikeButton cardId={card.id} />
+
+            {/* Save pill
+                Unsaved → ghost button  (transparent bg, grey border)
+                Saved   → primary action (#ebffb1 bg, lime border)
+                Both states use #000000 text — no dark/inverted treatment */}
+            <button
+              onClick={(e) => { e.stopPropagation(); onSave?.() }}
+              aria-label={saved ? 'Saved' : 'Save this card'}
+              className={[
+                'flex items-center gap-2 px-5 py-2.5 rounded-full text-[14px] font-medium',
+                'transition-all duration-200 select-none cursor-pointer text-[#000000]',
+                saved
+                  ? 'bg-[#ebffb1] border border-[#ade900]'
+                  : 'bg-transparent border border-[#cfcfcf] hover:border-[#ade900]',
+              ].join(' ')}
+            >
+              <svg
+                width="14" height="14" viewBox="0 0 24 24"
+                fill={saved ? '#000000' : 'none'}
+                stroke="currentColor" strokeWidth="2"
+                strokeLinecap="round" strokeLinejoin="round"
+                className="transition-all duration-200"
+              >
+                <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+              </svg>
+              <span>{saved ? 'Saved' : 'Save'}</span>
+            </button>
+          </div>
         </div>
       </div>
     </div>

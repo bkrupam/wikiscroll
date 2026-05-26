@@ -1,26 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPersonalizedCards } from '@/lib/algorithm'
-import { generateOneCardDirect, maybeRefillQueue } from '@/lib/queue'
+import { generateOneCardDirect, generateRelatedCard, maybeRefillQueue } from '@/lib/queue'
 
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url)
-    const exclude = searchParams.get('exclude')
+    const exclude   = searchParams.get('exclude')
+    const relatedTo = searchParams.get('relatedTo')   // rabbit hole: follow links from this article
     const excludeIds = exclude ? exclude.split(',').filter(Boolean) : []
 
+    // ── Rabbit hole path ───────────────────────────────────────────────────
+    // User has been dwelling long — serve a card linked from the article they
+    // were reading instead of the Thompson-ranked buffer.
+    if (relatedTo) {
+      const related = await generateRelatedCard(relatedTo)
+      if (related) {
+        maybeRefillQueue().catch(console.error)
+        return NextResponse.json({ card: related })
+      }
+      // If no linked article produced a good hook, fall through to normal path.
+    }
+
     // ── Fast path ──────────────────────────────────────────────────────────
-    // Most requests hit this — the buffer keeps 5 unserved cards ready,
-    // and Thompson Sampling picks the one best matched to the user's arms.
     const existing = await getPersonalizedCards(1, excludeIds)
     if (existing.length > 0) {
-      // Fire-and-forget background refill so the next request hits fast path too.
       maybeRefillQueue().catch(console.error)
       return NextResponse.json({ card: existing[0] })
     }
 
     // ── Slow path ──────────────────────────────────────────────────────────
-    // Buffer is genuinely empty (first ever request, or pathological case).
-    // Generate on the spot, then trigger refill so we don't repeat this.
     for (let attempt = 0; attempt < 3; attempt++) {
       const ok = await generateOneCardDirect()
       if (ok) {

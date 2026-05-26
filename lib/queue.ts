@@ -1,11 +1,32 @@
 import { db } from './db'
-import { extractHook } from './gemini'
+import { extractHookAndPath } from './groq'
+import { ROOT_TOPICS, seedRootTopics, upsertNode } from './topics'
 import {
   fetchArticleByTitle,
   fetchRandomArticle,
   fetchRandomFromCategory,
+  fetchLinkedArticles,
 } from './wikipedia'
 import { SEED_ARTICLES, BROAD_CATEGORIES } from '@/data/seeds'
+
+/**
+ * Resolve a Groq-returned [root, sub, subsub] path to TopicNode ids, creating
+ * the depth-1 / depth-2 nodes lazily if they don't yet exist under the root.
+ */
+async function resolvePath(path: [string, string, string]): Promise<string[]> {
+  await seedRootTopics()
+
+  const [rootName, subName, subSubName] = path
+  const rootNode = await db.topicNode.findFirst({
+    where: { name: rootName, depth: 0 },
+  })
+  if (!rootNode) return []
+
+  const subNode    = await upsertNode(subName,    1, rootNode.id)
+  const subSubNode = await upsertNode(subSubName, 2, subNode.id)
+
+  return [rootNode.id, subNode.id, subSubNode.id]
+}
 
 /** Target number of unserved cards to keep in the queue.
  *  Small enough that cold-start fill finishes in seconds, big enough that
@@ -135,8 +156,11 @@ async function _generateOneCardImpl(): Promise<boolean> {
 
   if (!article) return false
 
-  const hookResult = await extractHook(article.title, article.extract)
+  const hookResult = await extractHookAndPath(article.title, article.extract, ROOT_TOPICS)
   if (!hookResult) return false
+
+  const pathIds = await resolvePath(hookResult.path)
+  if (pathIds.length === 0) return false
 
   const gradientId = pickGradient(lastGradientId)
 
@@ -145,27 +169,86 @@ async function _generateOneCardImpl(): Promise<boolean> {
       hookText:   hookResult.hook,
       wikiTitle:  article.title,
       wikiUrl:    article.url,
-      categories: JSON.stringify(hookResult.categories),
+      categories: JSON.stringify(pathIds),
       gradientId,
       hookScore:  hookResult.score,
       tier,
     },
   })
 
-  // Upsert category arms (initialise if missing — Thompson Sampling prior)
-  for (const cat of hookResult.categories) {
-    await db.categoryArm.upsert({
-      where:  { category: cat },
-      update: {},
-      create: { category: cat, alpha: 1.0, beta: 1.0, totalPulls: 0 },
+  return true
+}
+
+export interface GeneratedCard {
+  id: string
+  hookText: string
+  wikiTitle: string
+  wikiUrl: string
+  categories: string[]
+  gradientId: number
+  tier: number
+}
+
+/**
+ * Generate a card that is topically related to `fromTitle` by following
+ * that article's own Wikipedia links. Used by rabbit hole mode.
+ *
+ * - Bypasses the mutex (same reasoning as generateOneCardDirect).
+ * - Returns the card directly and marks it served immediately so
+ *   the normal buffer fetch doesn't accidentally grab it first.
+ * - Falls back to a normal direct generation if no suitable linked
+ *   article produces a good hook (e.g. all links are stubs).
+ */
+export async function generateRelatedCard(fromTitle: string): Promise<GeneratedCard | null> {
+  const links = await fetchLinkedArticles(fromTitle)
+
+  // Try up to 15 linked articles in shuffled order before giving up
+  const candidates = shuffle([...links]).slice(0, 15)
+
+  for (const title of candidates) {
+    const article = await fetchArticleByTitle(title)
+    if (!article) continue
+
+    const hookResult = await extractHookAndPath(article.title, article.extract, ROOT_TOPICS)
+    if (!hookResult) continue
+
+    const pathIds = await resolvePath(hookResult.path)
+    if (pathIds.length === 0) continue
+
+    const lastGradientId = await getLastGradientId()
+    const gradientId = pickGradient(lastGradientId)
+
+    const card = await db.card.create({
+      data: {
+        hookText:   hookResult.hook,
+        wikiTitle:  article.title,
+        wikiUrl:    article.url,
+        categories: JSON.stringify(pathIds),
+        gradientId,
+        hookScore:  hookResult.score,
+        tier:       2,
+        served:     true,   // mark served immediately — bypasses the buffer
+      },
     })
+
+    return {
+      id:         card.id,
+      hookText:   card.hookText,
+      wikiTitle:  card.wikiTitle,
+      wikiUrl:    card.wikiUrl,
+      categories: [...hookResult.path],
+      gradientId: card.gradientId,
+      tier:       card.tier,
+    }
   }
 
-  return true
+  return null  // caller falls through to normal generation
 }
 
 /** Fill the queue up to QUEUE_TARGET unserved cards. Runs sequentially to avoid hammering APIs. */
 export async function fillQueue(): Promise<{ added: number; total: number }> {
+  await seedRootTopics()  // ensure roots exist before the very first card
+
   const unservedCount = await db.card.count({ where: { served: false } })
   const needed = Math.max(0, QUEUE_TARGET - unservedCount)
 

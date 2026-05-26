@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPersonalizedCards } from '@/lib/algorithm'
 import { maybeRefillQueue, fillQueue } from '@/lib/queue'
+import { db } from '@/lib/db'
 
 export async function GET(req: NextRequest) {
   try {
@@ -10,15 +11,34 @@ export async function GET(req: NextRequest) {
 
     const cards = await getPersonalizedCards(10, excludeIds)
 
+    // The algorithm stores TopicNode ids on the card; the UI wants names.
+    // Batch-resolve all referenced node ids in a single query.
+    const allIds = new Set<string>()
+    for (const c of cards) for (const id of c.categories) allIds.add(id)
+
+    let nameById = new Map<string, string>()
+    if (allIds.size > 0) {
+      const nodes = await db.topicNode.findMany({
+        where:  { id: { in: [...allIds] } },
+        select: { id: true, name: true },
+      })
+      nameById = new Map(nodes.map((n) => [n.id, n.name]))
+    }
+
+    const enriched = cards.map((c) => ({
+      ...c,
+      categories: c.categories
+        .map((id) => nameById.get(id))
+        .filter((n): n is string => Boolean(n)),
+    }))
+
     if (cards.length === 0) {
-      // Queue is empty — kick off an aggressive fill immediately
       fillQueue().catch(console.error)
     } else {
-      // Kick off background refill if queue is running low (fire & forget)
       maybeRefillQueue().catch(console.error)
     }
 
-    return NextResponse.json({ cards })
+    return NextResponse.json({ cards: enriched })
   } catch (err) {
     console.error('[/api/cards] Error:', err)
     return NextResponse.json({ cards: [], error: String(err) }, { status: 500 })

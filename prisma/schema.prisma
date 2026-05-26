@@ -12,7 +12,7 @@ model Card {
   hookText     String
   wikiTitle    String
   wikiUrl      String
-  categories   String        // JSON array: ["Psychology","History"]
+  categories   String        // JSON array of TopicNode ids — the [d0, d1, d2] path
   gradientId   Int           // 1–6
   hookScore    Float
   tier         Int           // 1=seed, 2=broad, 3=personalized
@@ -26,15 +26,29 @@ model Interaction {
   id           String   @id @default(cuid())
   cardId       String
   card         Card     @relation(fields: [cardId], references: [id])
-  type         String   // "LIKE" | "DWELL" | "SKIP"
+  type         String   // "LIKE" | "DWELL" | "SKIP" | "SAVE"
   dwellSeconds Float?
   createdAt    DateTime @default(now())
 }
 
+/// Hierarchical topic taxonomy. depth 0 = root, 1 = subtopic, 2 = sub-subtopic.
+model TopicNode {
+  id        String       @id @default(cuid())
+  name      String       @unique
+  parentId  String?
+  parent    TopicNode?   @relation("Children", fields: [parentId], references: [id])
+  children  TopicNode[]  @relation("Children")
+  depth     Int
+  createdAt DateTime     @default(now())
+
+  arm       CategoryArm?
+}
+
 model CategoryArm {
-  category   String   @id
-  alpha      Float    @default(1.0)
-  beta       Float    @default(1.0)
-  totalPulls Int      @default(0)
-  updatedAt  DateTime @updatedAt
+  nodeId     String    @id
+  node       TopicNode @relation(fields: [nodeId], references: [id])
+  alpha      Float     @default(1.0)
+  beta       Float     @default(1.0)
+  totalPulls Int       @default(0)
+  updatedAt  DateTime  @updatedAt
 }

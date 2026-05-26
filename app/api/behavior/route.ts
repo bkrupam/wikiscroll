@@ -4,16 +4,15 @@ import { updateArms } from '@/lib/algorithm'
 
 export async function POST(req: NextRequest) {
   try {
-    const { cardId, dwellSeconds } = await req.json() as {
+    const body = await req.json() as {
       cardId: string
-      dwellSeconds: number
+      dwellSeconds?: number
+      action?: 'SAVE' | 'SKIP'
     }
+    const { cardId, dwellSeconds, action } = body
 
-    if (!cardId || dwellSeconds === undefined) {
-      return NextResponse.json(
-        { ok: false, error: 'cardId and dwellSeconds required' },
-        { status: 400 }
-      )
+    if (!cardId) {
+      return NextResponse.json({ ok: false, error: 'cardId required' }, { status: 400 })
     }
 
     const card = await db.card.findUnique({ where: { id: cardId } })
@@ -23,10 +22,22 @@ export async function POST(req: NextRequest) {
     }
 
     const categories = JSON.parse(card.categories) as string[]
-    const type = dwellSeconds < 2 ? 'SKIP' : 'DWELL'
+
+    // Determine interaction type
+    let type: 'DWELL' | 'SKIP' | 'SAVE'
+    if (action === 'SAVE') {
+      type = 'SAVE'
+    } else if (action === 'SKIP') {
+      type = 'SKIP'
+    } else {
+      if (dwellSeconds === undefined) {
+        return NextResponse.json({ ok: false, error: 'dwellSeconds required' }, { status: 400 })
+      }
+      type = dwellSeconds < 2 ? 'SKIP' : 'DWELL'
+    }
 
     await db.interaction.create({
-      data: { cardId, type, dwellSeconds },
+      data: { cardId, type, dwellSeconds: dwellSeconds ?? null },
     })
 
     await updateArms(categories, type, dwellSeconds)

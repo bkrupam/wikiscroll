@@ -75,6 +75,40 @@ export async function fetchRandomFromCategory(category: string): Promise<WikiSum
   }
 }
 
+/**
+ * Fetch the titles of articles linked from a given Wikipedia page.
+ * Used for rabbit hole mode — when a user dwells long we follow
+ * the source article's own links rather than the Thompson-ranked buffer.
+ */
+export async function fetchLinkedArticles(title: string): Promise<string[]> {
+  try {
+    const params = new URLSearchParams({
+      action:      'query',
+      titles:      title,
+      prop:        'links',
+      pllimit:     '100',
+      plnamespace: '0',   // main namespace only (no Talk:, Wikipedia:, etc.)
+      format:      'json',
+      origin:      '*',
+    })
+    const res = await fetch(`${WIKI_API}?${params}`, {
+      headers: { 'User-Agent': 'WikiScroll/1.0 (educational project)' },
+      next: { revalidate: 0 },
+    })
+    if (!res.ok) return []
+    const data = await res.json()
+    const pages = data?.query?.pages ?? {}
+    const page = Object.values(pages)[0] as { links?: Array<{ title: string }> }
+    if (!page?.links) return []
+
+    return page.links
+      .map((l) => l.title)
+      .filter((t) => !SKIP_PREFIXES.some((p) => t.startsWith(p)))
+  } catch {
+    return []
+  }
+}
+
 /** Get Wikipedia categories for an article title */
 export async function fetchArticleCategories(title: string): Promise<string[]> {
   try {
