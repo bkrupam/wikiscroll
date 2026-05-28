@@ -12,7 +12,7 @@ export default function Home() {
       {/* Floating pill nav — centered, glass, doesn't stretch full width.
           pointer-events-none on the wrapper so the transparent area around
           the pill never blocks taps/clicks on the feed beneath it. */}
-      <header className="fixed top-0 left-0 right-0 z-50 flex justify-center pointer-events-none"
+      <header className="fixed top-0 left-0 right-0 z-40 flex justify-center pointer-events-none"
         style={{ paddingTop: '16px' }}>
 
         <nav

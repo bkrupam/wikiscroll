@@ -452,36 +452,34 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
     return () => window.removeEventListener('beforeunload', handleUnload)
   }, [activeIndex, cards])
 
-  // ── States ────────────────────────────────────────────────────────────────
-  if (error) {
-    return (
-      <FullViewport>
-        <div className="text-center">
-          <p className="text-[#696f7b] mb-4 text-[15px]">{error}</p>
-          <button
-            onClick={() => { setError(null); setLoading(true) }}
-            className="px-5 py-2 rounded-full bg-[#ebffb1] border border-[#ade900] text-sm font-medium"
-          >
-            Try again
-          </button>
-        </div>
-      </FullViewport>
-    )
-  }
-
-  if (loading) {
-    return (
-      <FullViewport>
-        <SkeletonPanel />
-      </FullViewport>
-    )
-  }
-
   const savedCardsList = cards.filter((c) => savedIds.has(c.id))
 
   // ── Main feed ─────────────────────────────────────────────────────────────
+  // Never early-return — modals must always be reachable from the nav buttons.
   return (
     <div className="fixed inset-0 overflow-hidden">
+
+      {/* Error / loading screens */}
+      {error && (
+        <FullViewport>
+          <div className="text-center">
+            <p className="text-[#696f7b] mb-4 text-[15px]">{error}</p>
+            <button
+              onClick={() => { setError(null); setLoading(true) }}
+              className="px-5 py-2 rounded-full bg-[#ebffb1] border border-[#ade900] text-sm font-medium"
+            >
+              Try again
+            </button>
+          </div>
+        </FullViewport>
+      )}
+      {loading && !error && (
+        <FullViewport>
+          <SkeletonPanel />
+        </FullViewport>
+      )}
+
+      {!error && !loading && (<>
 
       {/* Background gradients */}
       {cards.map((card, i) => (
@@ -505,7 +503,6 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
           }}
         />
       )}
-
 
       {/* Save toast — slides up from bottom, auto-dismisses */}
       <div
@@ -602,12 +599,12 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
         </div>
       )}
 
+      </>)}
+
       {/* Saves panel */}
       {showSaves && (
         <SavesPanel
           cards={savedCardsList}
-          savedIds={savedIds}
-          onSave={saveCard}
           onClose={() => setShowSaves(false)}
         />
       )}
@@ -621,17 +618,14 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
 // ── Saves panel ───────────────────────────────────────────────────────────────
 function SavesPanel({
   cards,
-  onSave,
   onClose,
 }: {
   cards: CardData[]
-  savedIds: Set<string>
-  onSave: (id: string) => void
   onClose: () => void
 }) {
   return (
     <div
-      className="fixed inset-0 z-50 flex items-end sm:items-center justify-center"
+      className="fixed inset-0 z-[200] flex items-end sm:items-center justify-center"
       onClick={onClose}
     >
       {/* Backdrop */}
@@ -676,36 +670,26 @@ function SavesPanel({
             cards.map((card) => (
               <div
                 key={card.id}
-                className="flex items-start gap-4 px-7 py-4 border-b border-[#f0eee9] last:border-0"
+                className="flex items-start gap-4 px-7 py-5 border-b border-[#f0eee9] last:border-0"
               >
                 <div className="flex-1 min-w-0">
                   {card.categories[0] && (
-                    <span className="text-[10px] font-semibold text-[#696f7b] tracking-[0.08em] uppercase">
+                    <span className="text-[10px] font-semibold text-[#696f7b] tracking-[0.08em] uppercase block mb-2">
                       {card.categories[0]}
                     </span>
                   )}
-                  <p className="text-[14px] text-[#22282a] font-[500] leading-snug mt-1 line-clamp-3">
+                  <p className="text-[14px] text-[#22282a] font-[500] leading-snug line-clamp-3">
                     {card.hookText}
                   </p>
                   <a
                     href={card.wikiUrl}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[12px] text-[#696f7b] hover:text-[#22282a] transition-colors mt-1.5 inline-block"
+                    className="text-[12px] text-[#696f7b] hover:text-[#22282a] transition-colors mt-3 inline-block"
                   >
                     {card.wikiTitle} ↗
                   </a>
                 </div>
-                <button
-                  onClick={() => onSave(card.id)}
-                  className="flex-shrink-0 mt-1 opacity-40 hover:opacity-100 transition-opacity"
-                  aria-label="Remove from saved"
-                >
-                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
-                    stroke="#696f7b" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                </button>
               </div>
             ))
           )}
