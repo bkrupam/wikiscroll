@@ -2,24 +2,27 @@ import { db } from './db'
 import type { Card } from '@prisma/client'
 
 /**
- * Hierarchical Thompson Sampling over a 3-level topic taxonomy.
+ * Hierarchical Thompson Sampling, per-user.
  *
  * Every card carries a path of TopicNode ids: [d0, d1, d2].
- * Each node has its own (alpha, beta) bandit arm.
+ * Each (user, node) has its own (alpha, beta) bandit arm.
  *
- * Scoring (per card) at request time:
- *   score = W0 * sample(d0) + W1 * sample(d1) + W2 * sample(d2)
- * The leaf gets the most weight because a long dwell on "Neuroplasticity"
- * is a far more specific taste signal than the parent "Psychology".
+ *   score(card) = W0·sample(d0) + W1·sample(d1) + W2·sample(d2)
  *
- * Signal propagation on like / long-dwell / save:
+ * Signal propagation along a card's path:
  *   leaf      α += Δ × 1.00
  *   parent    α += Δ × 0.50
  *   root      α += Δ × 0.25
- * Skip applies β with the same multipliers.
+ *
+ * Skip propagates β with the same multipliers.
+ *
+ * Opportunistic decay: at most once per 24h per user, every arm is pulled
+ * back toward the prior so old enthusiasms fade.
+ *   α ← 1 + (α − 1) · 0.95
+ *   β ← 1 + (β − 1) · 0.95
  */
 
-const LEVEL_WEIGHT = [0.25, 0.50, 1.00] as const  // d0, d1, d2
+const LEVEL_WEIGHT = [0.25, 0.50, 1.00] as const
 
 const DELTA = {
   SAVE:       3.0,
@@ -28,6 +31,9 @@ const DELTA = {
   DWELL_MED:  0.3,
   SKIP:       1.0,
 }
+
+const DECAY_FACTOR     = 0.95
+const DECAY_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 /* ── sampling helpers ────────────────────────────────────────────────────── */
 
@@ -61,63 +67,87 @@ function randn(): number {
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v)
 }
 
-/* ── arm updates ─────────────────────────────────────────────────────────── */
+/* ── decay ───────────────────────────────────────────────────────────────── */
 
-/**
- * Update arms along a card's path with depth-weighted multipliers.
- * `path` is the [d0, d1, d2] array of node ids stored on the card.
- */
+async function maybeApplyDecay(userId: string): Promise<void> {
+  const user = await db.user.findUnique({ where: { id: userId } })
+  if (!user) return
+  const since = Date.now() - user.lastDecayAt.getTime()
+  if (since < DECAY_INTERVAL_MS) return
+
+  const arms = await db.categoryArm.findMany({ where: { userId } })
+  for (const arm of arms) {
+    const newAlpha = 1 + (arm.alpha - 1) * DECAY_FACTOR
+    const newBeta  = 1 + (arm.beta  - 1) * DECAY_FACTOR
+    await db.categoryArm.update({
+      where: { userId_nodeId: { userId, nodeId: arm.nodeId } },
+      data:  { alpha: newAlpha, beta: newBeta },
+    })
+  }
+  await db.user.update({ where: { id: userId }, data: { lastDecayAt: new Date() } })
+}
+
+/* ── arm helpers ─────────────────────────────────────────────────────────── */
+
+async function bumpArm(
+  userId: string,
+  nodeId: string,
+  alphaInc: number,
+  betaInc:  number,
+): Promise<void> {
+  if (alphaInc === 0 && betaInc === 0) return
+  await db.categoryArm.upsert({
+    where:  { userId_nodeId: { userId, nodeId } },
+    create: {
+      userId, nodeId,
+      alpha: 1.0 + alphaInc,
+      beta:  1.0 + betaInc,
+      totalPulls: 1,
+    },
+    update: {
+      alpha:      { increment: alphaInc },
+      beta:       { increment: betaInc  },
+      totalPulls: { increment: 1 },
+    },
+  })
+}
+
+/* ── arm updates from card interactions ──────────────────────────────────── */
+
 export async function updateArms(
+  userId: string,
   path: string[],
   type: 'LIKE' | 'DWELL' | 'SKIP' | 'SAVE',
   dwellSeconds?: number,
+  skipStreakMultiplier = 1,
 ): Promise<void> {
-  // Decide the base delta from the signal type
   let baseAlpha = 0
   let baseBeta  = 0
 
   if (type === 'SAVE')      baseAlpha = DELTA.SAVE
   else if (type === 'LIKE') baseAlpha = DELTA.LIKE
-  else if (type === 'SKIP') baseBeta  = DELTA.SKIP
+  else if (type === 'SKIP') baseBeta  = DELTA.SKIP * skipStreakMultiplier
   else if (type === 'DWELL' && dwellSeconds !== undefined) {
     if (dwellSeconds >= 8)      baseAlpha = DELTA.DWELL_LONG
     else if (dwellSeconds >= 3) baseAlpha = DELTA.DWELL_MED
-    else if (dwellSeconds < 2)  baseBeta  = DELTA.SKIP
+    else if (dwellSeconds < 2)  baseBeta  = DELTA.SKIP * skipStreakMultiplier
   }
 
   if (baseAlpha === 0 && baseBeta === 0) return
 
   for (let i = 0; i < path.length && i < 3; i++) {
-    const nodeId = path[i]
-    if (!nodeId) continue
     const w = LEVEL_WEIGHT[i] ?? 1.0
-    const aInc = baseAlpha * w
-    const bInc = baseBeta  * w
-    if (aInc === 0 && bInc === 0) continue
-
-    await db.categoryArm.update({
-      where: { nodeId },
-      data: {
-        alpha:      { increment: aInc },
-        beta:       { increment: bInc },
-        totalPulls: { increment: 1 },
-      },
-    }).catch(() => {/* arm may not exist for legacy data — ignore */})
+    await bumpArm(userId, path[i], baseAlpha * w, baseBeta * w)
   }
 }
 
-/**
- * Apply an explicit manual selection from the settings modal.
- * Heavy boost on the chosen node + a small bump on its ancestors so the
- * higher-level arm sees context too.
- */
-export async function boostExplicit(nodeId: string): Promise<void> {
+/** Explicit manual selection from the settings modal: big α on the leaf
+ *  + tapered boost up the chain. */
+export async function boostExplicit(userId: string, nodeId: string): Promise<void> {
   const node = await db.topicNode.findUnique({ where: { id: nodeId } })
   if (!node) return
 
-  // Walk up the chain, biggest boost on the clicked node itself.
-  const chain: { id: string; weight: number }[] = []
-  chain.push({ id: node.id, weight: 5.0 })
+  const chain: { id: string; weight: number }[] = [{ id: node.id, weight: 5.0 }]
 
   let cursor = node
   let weight = 1.0
@@ -130,79 +160,62 @@ export async function boostExplicit(nodeId: string): Promise<void> {
   }
 
   for (const { id, weight } of chain) {
-    await db.categoryArm.update({
-      where: { nodeId: id },
-      data:  {
-        alpha:      { increment: weight },
-        totalPulls: { increment: 1 },
-      },
-    }).catch(() => {})
+    await bumpArm(userId, id, weight, 0)
   }
 }
 
-/**
- * Inverse of boostExplicit — explicit "remove this topic" from the modal.
- * Heavy β bump on the chosen node only. We do NOT propagate to parents:
- * removing "Neuroplasticity" doesn't mean the user hates "Psychology",
- * just that one branch.
- */
-export async function dampenExplicit(nodeId: string): Promise<void> {
-  const node = await db.topicNode.findUnique({ where: { id: nodeId } })
-  if (!node) return
-
-  await db.categoryArm.update({
-    where: { nodeId: node.id },
-    data:  {
-      beta:       { increment: 5.0 },
-      totalPulls: { increment: 1 },
-    },
-  }).catch(() => {})
+/** Inverse: explicit "remove this topic". Heavy β on the chosen node only. */
+export async function dampenExplicit(userId: string, nodeId: string): Promise<void> {
+  await bumpArm(userId, nodeId, 0, 5.0)
 }
 
 /* ── feed generation ─────────────────────────────────────────────────────── */
 
 type DbCard = Card
 
-function mapCard(c: DbCard) {
-  return {
-    id:         c.id,
-    hookText:   c.hookText,
-    wikiTitle:  c.wikiTitle,
-    wikiUrl:    c.wikiUrl,
-    categories: JSON.parse(c.categories) as string[],   // path of node ids
-    gradientId: c.gradientId,
-    tier:       c.tier,
-  }
+export interface ServedCard {
+  id:         string
+  hookText:   string
+  wikiTitle:  string
+  wikiUrl:    string
+  /** Human-readable topic names along the card's path. */
+  categories: string[]
+  gradientId: number
+  tier:       number
+  /** Caption: which topic on the user's profile this card was matched on. */
+  becauseOf:  string | null
 }
 
 /**
- * Score and pull the next batch of cards.
+ * Pull the next batch of cards for `userId`.
  *
- * 1. Read every arm into a map { nodeId -> sample }.
- * 2. For each unserved card, sum the weighted samples along its path.
- * 3. Sort descending, take top N — but reserve ~20% wildcard slots
- *    (random unserved cards) so exploration never dies.
+ * 1. Optional 24h decay pass.
+ * 2. Read every arm into a sample map.
+ * 3. Score each unserved card by Σ w_i · sample(path[i]).
+ * 4. Wildcard ~20% of slots from the bottom half.
+ * 5. Annotate each served card with the topic name that drove its rank.
  */
 export async function getPersonalizedCards(
+  userId: string,
   limit: number = 10,
   excludeIds: string[] = [],
-): Promise<ReturnType<typeof mapCard>[]> {
-  const arms = await db.categoryArm.findMany()
-  if (arms.length === 0) {
+): Promise<ServedCard[]> {
+  await maybeApplyDecay(userId)
+
+  const arms = await db.categoryArm.findMany({ where: { userId } })
+  const totalInteractions = await db.interaction.count({ where: { userId } })
+
+  // No-signal cold start — pull seeds + broad cards in tier order.
+  if (arms.length === 0 || totalInteractions < 8) {
     return fallbackCards(limit, excludeIds)
   }
 
-  // Pre-sample every arm once so all cards are scored against the same draw.
+  // Pre-sample every arm once so all candidates are scored against the same draw.
   const sampleByNode = new Map<string, number>()
+  const meanByNode   = new Map<string, number>()
   for (const arm of arms) {
     sampleByNode.set(arm.nodeId, sampleBeta(arm.alpha, arm.beta))
-  }
-
-  const totalInteractions = await db.interaction.count()
-
-  // Cold start — barely any signal — just serve seeds + broad
-  if (totalInteractions < 20) {
-    return fallbackCards(limit, excludeIds)
+    meanByNode.set(arm.nodeId, arm.alpha / (arm.alpha + arm.beta))
   }
 
   const candidates = await db.card.findMany({
@@ -210,83 +223,133 @@ export async function getPersonalizedCards(
     take: 200,
     orderBy: { createdAt: 'desc' },
   })
-
   if (candidates.length === 0) return []
 
   const wildcardCount = Math.max(1, Math.floor(limit * 0.2))
   const mainCount     = limit - wildcardCount
 
-  // Score every candidate
   const scored = candidates.map((c) => {
     const path = (JSON.parse(c.categories) as string[]).slice(0, 3)
-    let s = 0
+    let score = 0
+    // The arm that contributed the most to this card's score becomes its "because".
+    let topContribIdx = -1
+    let topContribValue = -Infinity
     for (let i = 0; i < path.length; i++) {
       const w = LEVEL_WEIGHT[i] ?? 1.0
-      const sample = sampleByNode.get(path[i]) ?? 0.5  // unknown node → neutral
-      s += w * sample
+      const s = sampleByNode.get(path[i]) ?? 0.5
+      const contrib = w * s
+      if (contrib > topContribValue) {
+        topContribValue = contrib
+        topContribIdx   = i
+      }
+      score += contrib
     }
-    return { card: c, score: s }
+    return { card: c, score, becauseNodeId: topContribIdx >= 0 ? path[topContribIdx] : null }
   })
 
   scored.sort((a, b) => b.score - a.score)
-  const mainCards = scored.slice(0, mainCount).map((s) => s.card)
-  const mainIds   = new Set(mainCards.map((c) => c.id))
 
-  // Wildcards: pick from the *bottom half* of the score distribution
-  // so they actually diverge from what we just picked.
-  const wildcardPool = scored.slice(Math.floor(scored.length / 2))
-    .map((s) => s.card)
-    .filter((c) => !mainIds.has(c.id))
+  const mainSelections = scored.slice(0, mainCount)
+  const mainIds        = new Set(mainSelections.map((s) => s.card.id))
+  const wildcardPool   = scored
+    .slice(Math.floor(scored.length / 2))
+    .filter((s) => !mainIds.has(s.card.id))
   shuffleInPlace(wildcardPool)
-  const wildcardCards = wildcardPool.slice(0, wildcardCount)
+  const wildcardSelections = wildcardPool.slice(0, wildcardCount)
 
   // Interleave: every 4 main cards, drop in a wildcard
-  const out: DbCard[] = []
+  const ordered: typeof scored = []
   let wi = 0
-  for (let i = 0; i < mainCards.length; i++) {
-    out.push(mainCards[i])
-    if ((i + 1) % 4 === 0 && wi < wildcardCards.length) {
-      out.push(wildcardCards[wi++])
+  for (let i = 0; i < mainSelections.length; i++) {
+    ordered.push(mainSelections[i])
+    if ((i + 1) % 4 === 0 && wi < wildcardSelections.length) {
+      ordered.push(wildcardSelections[wi++])
     }
   }
-  while (wi < wildcardCards.length) out.push(wildcardCards[wi++])
+  while (wi < wildcardSelections.length) ordered.push(wildcardSelections[wi++])
 
-  // Top up if we came up short
-  if (out.length < limit) {
-    const have = new Set(out.map((c) => c.id))
-    for (const c of candidates) {
-      if (out.length >= limit) break
-      if (!have.has(c.id)) out.push(c)
-    }
-  }
+  const final = ordered.slice(0, limit)
+  if (final.length === 0) return []
 
-  const final = out.slice(0, limit)
+  await db.card.updateMany({
+    where: { id: { in: final.map((s) => s.card.id) } },
+    data:  { served: true },
+  })
 
-  if (final.length > 0) {
-    await db.card.updateMany({
-      where: { id: { in: final.map((c) => c.id) } },
-      data:  { served: true },
-    })
-  }
-
-  return final.map(mapCard)
+  return resolveServedCards(final.map((s) => ({ card: s.card, becauseNodeId: s.becauseNodeId })))
 }
 
-/** Cold-start / no-arm fallback: pull by tier order. */
-async function fallbackCards(limit: number, excludeIds: string[]) {
+/** Cold-start / no-signal fallback. */
+async function fallbackCards(limit: number, excludeIds: string[]): Promise<ServedCard[]> {
   const cards = await db.card.findMany({
     where:   { served: false, id: { notIn: excludeIds } },
     orderBy: [{ tier: 'asc' }, { hookScore: 'desc' }],
     take:    limit,
   })
+  if (cards.length === 0) return []
+  await db.card.updateMany({
+    where: { id: { in: cards.map((c) => c.id) } },
+    data:  { served: true },
+  })
+  return resolveServedCards(cards.map((c) => ({ card: c, becauseNodeId: null })))
+}
 
-  if (cards.length > 0) {
-    await db.card.updateMany({
-      where: { id: { in: cards.map((c) => c.id) } },
-      data:  { served: true },
-    })
+/** Resolve nodeId paths and `becauseOf` into human names in a single DB roundtrip. */
+async function resolveServedCards(
+  items: Array<{ card: DbCard; becauseNodeId: string | null }>,
+): Promise<ServedCard[]> {
+  const ids = new Set<string>()
+  for (const { card, becauseNodeId } of items) {
+    for (const id of JSON.parse(card.categories) as string[]) ids.add(id)
+    if (becauseNodeId) ids.add(becauseNodeId)
   }
-  return cards.map(mapCard)
+  let nameById = new Map<string, string>()
+  if (ids.size > 0) {
+    const nodes = await db.topicNode.findMany({
+      where:  { id: { in: [...ids] } },
+      select: { id: true, name: true },
+    })
+    nameById = new Map(nodes.map((n) => [n.id, n.name]))
+  }
+
+  return items.map(({ card, becauseNodeId }) => ({
+    id:         card.id,
+    hookText:   card.hookText,
+    wikiTitle:  card.wikiTitle,
+    wikiUrl:    card.wikiUrl,
+    categories: (JSON.parse(card.categories) as string[])
+                  .map((id) => nameById.get(id))
+                  .filter((n): n is string => Boolean(n)),
+    gradientId: card.gradientId,
+    tier:       card.tier,
+    becauseOf:  becauseNodeId ? nameById.get(becauseNodeId) ?? null : null,
+  }))
+}
+
+/* ── skip streak helper ──────────────────────────────────────────────────── */
+
+/**
+ * Detect a skip streak for the given leaf node id. Walks the last 6 SKIP/DWELL<2
+ * interactions for this user; if 3+ in a row share the same leaf, multiplier
+ * grows linearly. Returns a multiplier ≥ 1.
+ */
+export async function skipStreakMultiplier(
+  userId: string,
+  leafNodeId: string | null,
+): Promise<number> {
+  if (!leafNodeId) return 1
+  const recent = await db.interaction.findMany({
+    where: { userId, type: 'SKIP' },
+    orderBy: { createdAt: 'desc' },
+    take: 6,
+  })
+  let streak = 0
+  for (const r of recent) {
+    if (r.leafNodeId === leafNodeId) streak++
+    else break
+  }
+  if (streak >= 3) return 1 + (streak - 2) * 0.75   // 1.75x, 2.5x, 3.25x …
+  return 1
 }
 
 function shuffleInPlace<T>(arr: T[]): void {

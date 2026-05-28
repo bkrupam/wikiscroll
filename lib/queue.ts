@@ -59,8 +59,16 @@ async function withGenerationLock<T>(fn: () => Promise<T>): Promise<T> {
 /** 6 gradient variants — assigned round-robin, never two in a row */
 const GRADIENT_COUNT = 6
 
-/** Track which seeds have already been queued (in-memory across calls in the same process) */
-const usedSeeds = new Set<string>()
+/** DB-backed seed dedup: a wikiTitle is "used" iff a Card already exists for it.
+ *  Card.wikiTitle has a unique index so the lookup is O(1). */
+async function unusedSeedTitles(): Promise<string[]> {
+  const existing = await db.card.findMany({
+    where:  { wikiTitle: { in: [...SEED_ARTICLES] } },
+    select: { wikiTitle: true },
+  })
+  const used = new Set(existing.map((c) => c.wikiTitle))
+  return SEED_ARTICLES.filter((s) => !used.has(s))
+}
 
 /** Generate a gradient ID that differs from the last one used */
 function pickGradient(lastGradientId?: number): number {
@@ -124,10 +132,9 @@ async function _generateOneCardImpl(): Promise<boolean> {
 
   // ── Tier 1: hand-picked seed articles ─────────────────────────────────────
   if (tier === 1) {
-    const available = SEED_ARTICLES.filter((s) => !usedSeeds.has(s))
+    const available = await unusedSeedTitles()
     if (available.length > 0) {
       const title = available[Math.floor(Math.random() * available.length)]
-      usedSeeds.add(title)
       article = await fetchArticleByTitle(title)
     }
     // If seeds exhausted or article fetch failed, fall through to category logic
@@ -156,6 +163,11 @@ async function _generateOneCardImpl(): Promise<boolean> {
 
   if (!article) return false
 
+  // Cheap dedup — Card.wikiTitle is unique. Catches races and any random/category
+  // pulls that happen to re-pick an already-stored article.
+  const existing = await db.card.findUnique({ where: { wikiTitle: article.title } })
+  if (existing) return false
+
   const hookResult = await extractHookAndPath(article.title, article.extract, ROOT_TOPICS)
   if (!hookResult) return false
 
@@ -164,17 +176,22 @@ async function _generateOneCardImpl(): Promise<boolean> {
 
   const gradientId = pickGradient(lastGradientId)
 
-  await db.card.create({
-    data: {
-      hookText:   hookResult.hook,
-      wikiTitle:  article.title,
-      wikiUrl:    article.url,
-      categories: JSON.stringify(pathIds),
-      gradientId,
-      hookScore:  hookResult.score,
-      tier,
-    },
-  })
+  try {
+    await db.card.create({
+      data: {
+        hookText:   hookResult.hook,
+        wikiTitle:  article.title,
+        wikiUrl:    article.url,
+        categories: JSON.stringify(pathIds),
+        gradientId,
+        hookScore:  hookResult.score,
+        tier,
+      },
+    })
+  } catch {
+    // Lost the dedup race — another concurrent generation stored this title first.
+    return false
+  }
 
   return true
 }
@@ -187,6 +204,7 @@ export interface GeneratedCard {
   categories: string[]
   gradientId: number
   tier: number
+  becauseOf: string | null
 }
 
 /**
@@ -209,6 +227,9 @@ export async function generateRelatedCard(fromTitle: string): Promise<GeneratedC
     const article = await fetchArticleByTitle(title)
     if (!article) continue
 
+    const dup = await db.card.findUnique({ where: { wikiTitle: article.title } })
+    if (dup) continue
+
     const hookResult = await extractHookAndPath(article.title, article.extract, ROOT_TOPICS)
     if (!hookResult) continue
 
@@ -218,18 +239,23 @@ export async function generateRelatedCard(fromTitle: string): Promise<GeneratedC
     const lastGradientId = await getLastGradientId()
     const gradientId = pickGradient(lastGradientId)
 
-    const card = await db.card.create({
-      data: {
-        hookText:   hookResult.hook,
-        wikiTitle:  article.title,
-        wikiUrl:    article.url,
-        categories: JSON.stringify(pathIds),
-        gradientId,
-        hookScore:  hookResult.score,
-        tier:       2,
-        served:     true,   // mark served immediately — bypasses the buffer
-      },
-    })
+    let card
+    try {
+      card = await db.card.create({
+        data: {
+          hookText:   hookResult.hook,
+          wikiTitle:  article.title,
+          wikiUrl:    article.url,
+          categories: JSON.stringify(pathIds),
+          gradientId,
+          hookScore:  hookResult.score,
+          tier:       2,
+          served:     true,
+        },
+      })
+    } catch {
+      continue
+    }
 
     return {
       id:         card.id,
@@ -239,6 +265,7 @@ export async function generateRelatedCard(fromTitle: string): Promise<GeneratedC
       categories: [...hookResult.path],
       gradientId: card.gradientId,
       tier:       card.tier,
+      becauseOf:  hookResult.path[0] ?? null,   // rabbit hole — surface the root topic
     }
   }
 

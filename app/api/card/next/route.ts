@@ -1,46 +1,52 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { getPersonalizedCards } from '@/lib/algorithm'
 import { generateOneCardDirect, generateRelatedCard, maybeRefillQueue } from '@/lib/queue'
+import { ensureUser, attachUserCookie } from '@/lib/user'
 
 export async function GET(req: NextRequest) {
   try {
+    const { userId, isNew } = await ensureUser(req)
+
     const { searchParams } = new URL(req.url)
     const exclude   = searchParams.get('exclude')
-    const relatedTo = searchParams.get('relatedTo')   // rabbit hole: follow links from this article
+    const relatedTo = searchParams.get('relatedTo')
     const excludeIds = exclude ? exclude.split(',').filter(Boolean) : []
 
-    // ── Rabbit hole path ───────────────────────────────────────────────────
-    // User has been dwelling long — serve a card linked from the article they
-    // were reading instead of the Thompson-ranked buffer.
+    const respond = (body: object, status = 200) => {
+      const res = NextResponse.json(body, { status })
+      if (isNew) attachUserCookie(res, userId)
+      return res
+    }
+
+    // Rabbit hole path
     if (relatedTo) {
       const related = await generateRelatedCard(relatedTo)
       if (related) {
         maybeRefillQueue().catch(console.error)
-        return NextResponse.json({ card: related })
+        return respond({ card: related })
       }
-      // If no linked article produced a good hook, fall through to normal path.
     }
 
-    // ── Fast path ──────────────────────────────────────────────────────────
-    const existing = await getPersonalizedCards(1, excludeIds)
+    // Fast path: pull from the served-queue with Thompson ranking
+    const existing = await getPersonalizedCards(userId, 1, excludeIds)
     if (existing.length > 0) {
       maybeRefillQueue().catch(console.error)
-      return NextResponse.json({ card: existing[0] })
+      return respond({ card: existing[0] })
     }
 
-    // ── Slow path ──────────────────────────────────────────────────────────
+    // Slow path: queue is empty — synthesize one
     for (let attempt = 0; attempt < 3; attempt++) {
       const ok = await generateOneCardDirect()
       if (ok) {
-        const fresh = await getPersonalizedCards(1, excludeIds)
+        const fresh = await getPersonalizedCards(userId, 1, excludeIds)
         if (fresh.length > 0) {
           maybeRefillQueue().catch(console.error)
-          return NextResponse.json({ card: fresh[0] })
+          return respond({ card: fresh[0] })
         }
       }
     }
 
-    return NextResponse.json({ card: null }, { status: 503 })
+    return respond({ card: null }, 503)
   } catch (err) {
     console.error('[/api/card/next] Error:', err)
     return NextResponse.json({ card: null, error: String(err) }, { status: 500 })

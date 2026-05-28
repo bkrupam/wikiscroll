@@ -1,36 +1,43 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { seedRootTopics } from '@/lib/topics'
+import { ensureUser, attachUserCookie } from '@/lib/user'
 
-/**
- * Returns the user's taste tree.
- *  - `roots`: every depth-0 TopicNode with its arm stats.
- *  - Children are NOT included here; the client lazy-loads via /api/taste/children.
- */
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const { userId, isNew } = await ensureUser(req)
     await seedRootTopics()
 
     const roots = await db.topicNode.findMany({
       where:   { depth: 0 },
-      include: { arm: true, children: { select: { id: true } } },
+      include: {
+        children: { select: { id: true } },
+        arms:     { where: { userId } },
+      },
       orderBy: { name: 'asc' },
     })
 
-    const result = roots.map((n) => ({
-      id:           n.id,
-      name:         n.name,
-      depth:        n.depth,
-      hasChildren:  n.children.length > 0,
-      alpha:        n.arm?.alpha ?? 1,
-      beta:         n.arm?.beta  ?? 1,
-      totalPulls:   n.arm?.totalPulls ?? 0,
-      mean:         n.arm ? n.arm.alpha / (n.arm.alpha + n.arm.beta) : 0.5,
-    }))
+    const result = roots.map((n) => {
+      const arm = n.arms[0]
+      const alpha = arm?.alpha ?? 1
+      const beta  = arm?.beta  ?? 1
+      return {
+        id:           n.id,
+        name:         n.name,
+        depth:        n.depth,
+        hasChildren:  n.children.length > 0,
+        alpha,
+        beta,
+        totalPulls:   arm?.totalPulls ?? 0,
+        mean:         alpha / (alpha + beta),
+      }
+    })
 
-    return NextResponse.json({ roots: result })
+    const res = NextResponse.json({ roots: result })
+    if (isNew) attachUserCookie(res, userId)
+    return res
   } catch (err) {
     console.error('[/api/taste] Error:', err)
-    return NextResponse.json({ roots: [] }, { status: 500 })
+    return NextResponse.json({ roots: [], error: String(err) }, { status: 500 })
   }
 }

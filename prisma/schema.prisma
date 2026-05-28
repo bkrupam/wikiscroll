@@ -7,28 +7,48 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+/// Anonymous user identified by a cookie. We never collect anything beyond the id.
+model User {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  /// Last time the daily α/β decay job ran for this user.
+  lastDecayAt DateTime @default(now())
+
+  interactions Interaction[]
+  arms         CategoryArm[]
+  saves        SavedCard[]
+}
+
 model Card {
   id           String        @id @default(cuid())
   hookText     String
-  wikiTitle    String
+  wikiTitle    String        @unique
   wikiUrl      String
   categories   String        // JSON array of TopicNode ids — the [d0, d1, d2] path
-  gradientId   Int           // 1–6
+  gradientId   Int
   hookScore    Float
-  tier         Int           // 1=seed, 2=broad, 3=personalized
+  tier         Int
   served       Boolean       @default(false)
   createdAt    DateTime      @default(now())
 
   interactions Interaction[]
+  saves        SavedCard[]
 }
 
 model Interaction {
   id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
   cardId       String
   card         Card     @relation(fields: [cardId], references: [id])
   type         String   // "LIKE" | "DWELL" | "SKIP" | "SAVE"
   dwellSeconds Float?
+  /// JSON array of leaf nodeIds touched by this interaction — used for
+  /// skip-streak detection without re-reading the card on every behavior write.
+  leafNodeId   String?
   createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
 
 /// Hierarchical topic taxonomy. depth 0 = root, 1 = subtopic, 2 = sub-subtopic.
@@ -41,14 +61,30 @@ model TopicNode {
   depth     Int
   createdAt DateTime     @default(now())
 
-  arm       CategoryArm?
+  arms      CategoryArm[]
 }
 
+/// One bandit arm per (user, topic). Composite PK.
 model CategoryArm {
-  nodeId     String    @id
+  userId     String
+  nodeId     String
+  user       User      @relation(fields: [userId], references: [id])
   node       TopicNode @relation(fields: [nodeId], references: [id])
   alpha      Float     @default(1.0)
   beta       Float     @default(1.0)
   totalPulls Int       @default(0)
   updatedAt  DateTime  @updatedAt
+
+  @@id([userId, nodeId])
+}
+
+model SavedCard {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  cardId    String
+  card      Card     @relation(fields: [cardId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@unique([userId, cardId])
 }

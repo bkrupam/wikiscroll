@@ -10,6 +10,8 @@ export interface CardData {
   categories: string[]
   gradientId: number
   tier: number
+  /** Caption: which topic in the user's profile this card was matched on. */
+  becauseOf?: string | null
 }
 
 // Page-background gradients — applied by the Feed, not the card
@@ -26,11 +28,10 @@ interface CardPanelProps {
   card: CardData
   saved?: boolean
   onSave?: () => void
-  threadLabel?: string   // e.g. "Hellenistic Greece" — shown when rabbit hole active
 }
 
 /** Pure presentational white card — Base44-style panel sitting on the gradient */
-export function CardPanel({ card, saved = false, onSave, threadLabel }: CardPanelProps) {
+export function CardPanel({ card, saved = false, onSave }: CardPanelProps) {
   return (
     <div className="relative w-full max-w-[920px]">
       <div
@@ -42,25 +43,6 @@ export function CardPanel({ card, saved = false, onSave, threadLabel }: CardPane
           boxShadow: 'rgba(34, 40, 42, 0.06) 0px 4px 24px 0px',
         }}
       >
-        {/* Thread label — appears when rabbit hole is active */}
-        {threadLabel && (
-          <div
-            className="flex items-center gap-1.5 mb-5"
-            style={{
-              opacity: 1,
-              animation: 'fadeIn 0.3s ease-out',
-            }}
-          >
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none"
-              stroke="#696f7b" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-            <span className="text-[11px] text-[#696f7b] font-medium tracking-[0.04em]">
-              following · {threadLabel}
-            </span>
-          </div>
-        )}
-
         {/* Category tags */}
         {card.categories.length > 0 && (
           <div className="flex gap-3 flex-wrap mb-8">
@@ -87,6 +69,14 @@ export function CardPanel({ card, saved = false, onSave, threadLabel }: CardPane
         >
           {card.hookText}
         </p>
+
+        {/* "Why am I seeing this" caption — only when the algorithm picked
+            the card based on a topic the user already engaged with. */}
+        {card.becauseOf && (
+          <p className="mt-6 text-[11px] text-[#696f7b]" style={{ letterSpacing: '0.04em' }}>
+            Because you liked <span className="text-[#000000] font-medium">{card.becauseOf}</span>
+          </p>
+        )}
 
         {/* Footer */}
         <div className="flex items-center justify-between mt-12 pt-6 border-t border-[#f0eee9]">

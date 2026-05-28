@@ -12,15 +12,11 @@ export interface FeedHandle {
 }
 
 /**
- * Feed — on-demand 1-card lookahead with save + rabbit hole mode.
+ * Feed — on-demand 1-card lookahead with save.
  *
  * Navigation:    ↑ / ↓  |  scroll wheel  |  touch swipe up/down
  * Save card:     →       |  touch swipe right
  * Skip (signal): ←       |  touch swipe left
- *
- * Rabbit hole: after 2 consecutive dwells ≥ 15 s the next fetch passes
- * relatedTo=wikiTitle so the server follows that article's links instead of
- * the Thompson-ranked buffer. Two fast swipes (< 2 s each) exit the thread.
  */
 
 const TRANSITION_MS   = 650
@@ -28,10 +24,11 @@ const WHEEL_THRESHOLD = 40
 const TOUCH_THRESHOLD = 50
 const GRADIENT_COUNT  = 6
 
-// Rabbit hole thresholds
-const RABBIT_HOLE_DWELL_S = 15   // seconds that count as a "deep read"
-const RABBIT_HOLE_TRIGGER = 2    // consecutive deep reads before activating
-const RABBIT_HOLE_EXIT    = 2    // consecutive fast swipes (< 2 s) to exit
+// Rabbit hole — activated after 2 consecutive long dwells, exits after cap or fast swipes
+const RABBIT_HOLE_DWELL_S   = 15   // seconds to count as a "long dwell"
+const RABBIT_HOLE_TRIGGER   = 2    // consecutive long dwells to activate
+const RABBIT_HOLE_MAX_CARDS = 15   // auto-exit after this many rabbit hole cards
+const RABBIT_HOLE_EXIT      = 2    // consecutive fast swipes to exit
 
 const SKELETON_GRADIENT =
   'linear-gradient(180deg, rgb(242, 241, 237) 0%, rgb(213, 223, 224) 70%, rgb(229, 255, 148) 100%)'
@@ -43,16 +40,31 @@ function pickNextGradient(lastId: number | undefined): number {
   return id
 }
 
-function loadSavedIds(): Set<string> {
-  if (typeof window === 'undefined') return new Set()
+/** Hydrate from /api/saves (DB-backed). Legacy localStorage migration runs once
+ *  on first load so anyone who saved cards in the old build doesn't lose them. */
+async function fetchSavedIds(): Promise<Set<string>> {
   try {
-    const raw = localStorage.getItem('wikiscroll-saved')
-    return raw ? new Set(JSON.parse(raw) as string[]) : new Set()
+    const res = await fetch('/api/saves')
+    if (!res.ok) return new Set()
+    const data = await res.json() as { ids?: string[] }
+    return new Set(data.ids ?? [])
   } catch { return new Set() }
 }
 
-function persistSavedIds(ids: Set<string>) {
-  try { localStorage.setItem('wikiscroll-saved', JSON.stringify([...ids])) } catch { /* noop */ }
+async function migrateLegacyLocalSaves(): Promise<void> {
+  if (typeof window === 'undefined') return
+  const raw = localStorage.getItem('wikiscroll-saved')
+  if (!raw) return
+  try {
+    const ids = JSON.parse(raw) as string[]
+    if (ids.length === 0) { localStorage.removeItem('wikiscroll-saved'); return }
+    await fetch('/api/saves', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ add: ids }),
+    })
+    localStorage.removeItem('wikiscroll-saved')
+  } catch { /* noop */ }
 }
 
 export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
@@ -63,8 +75,8 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
   const [isPrefetching, setIsPrefetching]   = useState(false)
   const [enteringCardId, setEnteringCardId] = useState<string | null>(null)
 
-  // Save feature
-  const [savedIds, setSavedIds]   = useState<Set<string>>(loadSavedIds)
+  // Save feature — hydrated from /api/saves on mount
+  const [savedIds, setSavedIds]   = useState<Set<string>>(new Set())
   const [showSaves, setShowSaves] = useState(false)
   const [toastVisible, setToastVisible] = useState(false)
 
@@ -76,10 +88,6 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
     openTaste: () => setShowTaste(true),
     openSaves: () => setShowSaves(true),
   }))
-
-  // Rabbit hole
-  const [isRabbitHole, setIsRabbitHole]         = useState(false)
-  const [rabbitHoleTitle, setRabbitHoleTitle]   = useState<string | null>(null)
 
   // Hints — visible for first 3 card advances, then gone forever
   const [hintsVisible, setHintsVisible] = useState(true)
@@ -99,18 +107,17 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
   const cardsRef           = useRef<CardData[]>([])
   const toastTimerRef      = useRef<number | null>(null)
 
-  // Rabbit hole refs (readable inside event handlers / async callbacks)
-  const consecutiveLongDwellsRef = useRef(0)
-  const fastSwipeCountRef        = useRef(0)
+  // Rabbit hole refs — no React state needed (nothing renders from them)
   const isRabbitHoleRef          = useRef(false)
   const rabbitHoleTitleRef       = useRef<string | null>(null)
+  const consecutiveLongDwellsRef = useRef(0)
+  const fastSwipeCountRef        = useRef(0)
+  const rabbitHoleCardsRef       = useRef(0)
 
   // Keep refs in sync with state
-  useEffect(() => { activeIndexRef.current   = activeIndex },   [activeIndex])
-  useEffect(() => { cardsLengthRef.current   = cards.length },  [cards.length])
-  useEffect(() => { cardsRef.current         = cards },         [cards])
-  useEffect(() => { isRabbitHoleRef.current  = isRabbitHole },  [isRabbitHole])
-  useEffect(() => { rabbitHoleTitleRef.current = rabbitHoleTitle }, [rabbitHoleTitle])
+  useEffect(() => { activeIndexRef.current = activeIndex },  [activeIndex])
+  useEffect(() => { cardsLengthRef.current = cards.length }, [cards.length])
+  useEffect(() => { cardsRef.current       = cards },        [cards])
 
   // Sync save count into the nav bar badge rendered by page.tsx
   useEffect(() => {
@@ -142,15 +149,11 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
   }, [savedIds.size])
 
   // ── Single-card fetch ─────────────────────────────────────────────────────
-  const fetchOneCard = useCallback(async (relatedTo?: string): Promise<CardData | null> => {
-    const params = new URLSearchParams()
+  const fetchOneCard = useCallback(async (): Promise<CardData | null> => {
     const excludeParam = [...loadedIdsRef.current].join(',')
-    if (excludeParam) params.set('exclude', excludeParam)
-    if (relatedTo)    params.set('relatedTo', relatedTo)
-    const qs  = params.size ? '?' + params.toString() : ''
-    const url = `/api/card/next${qs}`
+    const qs = excludeParam ? `?exclude=${excludeParam}` : ''
     try {
-      const res = await fetch(url)
+      const res = await fetch(`/api/card/next${qs}`)
       if (!res.ok) return null
       const data = await res.json() as { card: CardData | null }
       return data.card ?? null
@@ -165,15 +168,23 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
     isPrefetchingRef.current = true
     setIsPrefetching(true)
 
-    const relatedTo = isRabbitHoleRef.current
-      ? (rabbitHoleTitleRef.current ?? undefined)
-      : undefined
-
     let card: CardData | null = null
     const MAX_ATTEMPTS = 6
 
+    // In rabbit hole mode, try to fetch a related card first
+    if (isRabbitHoleRef.current && rabbitHoleTitleRef.current) {
+      try {
+        const fromTitle = encodeURIComponent(rabbitHoleTitleRef.current)
+        const res = await fetch(`/api/card/next?relatedTo=${fromTitle}`)
+        if (res.ok) {
+          const data = await res.json() as { card: CardData | null }
+          card = data.card ?? null
+        }
+      } catch { /* fall through to normal fetch */ }
+    }
+
     for (let attempt = 0; attempt < MAX_ATTEMPTS && !card; attempt++) {
-      card = await fetchOneCard(relatedTo)
+      card = await fetchOneCard()
       if (!card && attempt < MAX_ATTEMPTS - 1) {
         const delay = Math.min(1000 * Math.pow(1.5, attempt), 4000)
         await new Promise<void>((r) => window.setTimeout(r, delay))
@@ -200,7 +211,11 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
     initFiredRef.current = true
     const init = async () => {
       setLoading(true)
-      const card = await fetchOneCard()
+      // Hydrate saves in parallel with the first card fetch.
+      // Migrate any legacy localStorage saves once, then read from DB.
+      await migrateLegacyLocalSaves()
+      const [card, ids] = await Promise.all([fetchOneCard(), fetchSavedIds()])
+      setSavedIds(ids)
       if (card) {
         loadedIdsRef.current.add(card.id)
         setCards([{ ...card, gradientId: pickNextGradient(undefined) }])
@@ -228,26 +243,34 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
   }, [isPrefetching, activeIndex, cards.length])
 
   // ── Save a card ───────────────────────────────────────────────────────────
+  // Persists through /api/saves (DB, per-user). Optimistic UI + fire-and-forget.
   const saveCard = useCallback((cardId: string) => {
     setSavedIds((prev) => {
       const next = new Set(prev)
-      if (next.has(cardId)) {
-        next.delete(cardId)
-        // No toast on unsave — just silently remove
-      } else {
+      const adding = !next.has(cardId)
+      if (adding) {
         next.add(cardId)
-        // Show toast
         setToastVisible(true)
         if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
         toastTimerRef.current = window.setTimeout(() => setToastVisible(false), 2000)
-        // Signal to algorithm
         fetch('/api/behavior', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ cardId, action: 'SAVE' }),
         }).catch(console.error)
+        fetch('/api/saves', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ add: [cardId] }),
+        }).catch(console.error)
+      } else {
+        next.delete(cardId)
+        fetch('/api/saves', {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ remove: [cardId] }),
+        }).catch(console.error)
       }
-      persistSavedIds(next)
       return next
     })
   }, [])
@@ -372,40 +395,39 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
       }
     }
 
-    // ── Rabbit hole counter ────────────────────────────────────────────────
+    // ── Rabbit hole tracking (no UI — purely drives the fetch path) ──────────
+    const exitRabbitHole = () => {
+      isRabbitHoleRef.current    = false
+      rabbitHoleTitleRef.current = null
+      fastSwipeCountRef.current  = 0
+      rabbitHoleCardsRef.current = 0
+    }
+
+    if (isRabbitHoleRef.current) {
+      rabbitHoleCardsRef.current += 1
+      if (rabbitHoleCardsRef.current >= RABBIT_HOLE_MAX_CARDS) exitRabbitHole()
+    }
+
     if (dwellSeconds >= RABBIT_HOLE_DWELL_S) {
       consecutiveLongDwellsRef.current += 1
       fastSwipeCountRef.current = 0
 
       if (!isRabbitHoleRef.current && consecutiveLongDwellsRef.current >= RABBIT_HOLE_TRIGGER) {
-        // Activate — follow links from the article the user just left
-        const src = cards[prev]?.wikiTitle ?? null
-        setIsRabbitHole(true)
-        setRabbitHoleTitle(src)
         isRabbitHoleRef.current    = true
-        rabbitHoleTitleRef.current = src
+        rabbitHoleTitleRef.current = cards[prev]?.wikiTitle ?? null
+        rabbitHoleCardsRef.current = 0
       } else if (isRabbitHoleRef.current && cards[activeIndex]) {
-        // Already in rabbit hole — advance the source so thread keeps moving forward
-        const nxt = cards[activeIndex].wikiTitle
-        setRabbitHoleTitle(nxt)
-        rabbitHoleTitleRef.current = nxt
+        rabbitHoleTitleRef.current = cards[activeIndex].wikiTitle
       }
     } else if (dwellSeconds < 2) {
       consecutiveLongDwellsRef.current = 0
       if (isRabbitHoleRef.current) {
         fastSwipeCountRef.current += 1
-        if (fastSwipeCountRef.current >= RABBIT_HOLE_EXIT) {
-          setIsRabbitHole(false)
-          setRabbitHoleTitle(null)
-          isRabbitHoleRef.current    = false
-          rabbitHoleTitleRef.current = null
-          fastSwipeCountRef.current  = 0
-        }
+        if (fastSwipeCountRef.current >= RABBIT_HOLE_EXIT) exitRabbitHole()
       } else {
         fastSwipeCountRef.current = 0
       }
     } else {
-      // Medium dwell (2–15 s) — doesn't push either counter
       fastSwipeCountRef.current = 0
     }
 
@@ -521,9 +543,6 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
         {cards.map((card, i) => {
           const offset      = i - activeIndex
           if (Math.abs(offset) > 1) return null
-          const threadLabel = (isRabbitHole && i === activeIndex && rabbitHoleTitle)
-            ? rabbitHoleTitle
-            : undefined
           return (
             <div
               key={card.id}
@@ -539,7 +558,6 @@ export const Feed = forwardRef<FeedHandle>(function Feed(_, ref) {
                   card={card}
                   saved={savedIds.has(card.id)}
                   onSave={() => saveCard(card.id)}
-                  threadLabel={threadLabel}
                 />
               </div>
             </div>
